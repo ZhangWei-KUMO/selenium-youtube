@@ -1,153 +1,198 @@
+import time
+import random
 import pandas as pd
-import numpy as np  # 用於處理可能的 NaN 值
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service  # For specifying driver path
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-# --- 設定參數 ---
-# 輸入的 CSV 檔案路徑 (爬蟲輸出的檔案)
-input_csv_path = "nccu_library_scrape_胡_dynamic.csv"  # 請確保這是你爬蟲輸出的正確檔名
 
-# 輸出的 CSV 檔案路徑 (合併後的結果)
-output_csv_path = "nccu_library_merged_resumes_final.csv"
+def scrape_nccu_lib_dynamic(max_pages=75, driver_path=None):
+    """
+    使用 Selenium 從動態加載的國立政治大學圖書館搜尋結果頁面爬取表格數據。
 
-# --- 根據你提供的表頭設定欄位名稱 ---
-name_column = "姓名Name"
+    Args:
+        max_pages (int): 要爬取的最大頁數。
+        driver_path (str, optional): WebDriver 的路徑。
+                                     如果為 None，Selenium 會嘗試從系統 PATH 找。
+                                     建議明確提供路徑，例如 'path/to/chromedriver.exe'。
 
-# 用於組合單個履歷條目的欄位 (按希望的順序排列)
-# 我們將把這些欄位的內容格式化成一個字串代表單次經歷
-entry_component_columns = [
-    "命令日期Release date",
-    "機關 | 官/職等 | 職務Organization | Rank/Grade | Capacity",
-    "原因Reason",
-    "類別Category",  # 也可以加入類別和狀態
-    "狀態Situation",
-]
+    Returns:
+        pandas.DataFrame: 包含所有爬取數據的 DataFrame。
+                         如果爬取失敗或找不到數據，則返回空的 DataFrame。
+    """
+    base_url = "https://gpost.lib.nccu.edu.tw/display.php?&q=%E8%83%A1&pagenumber=100&order=default&orderype=asc&tpl=rough&page="
+    all_data = []
+    headers_list = []
+    target_table_id = "searchresult_tb"  # 目標表格 ID
 
-# 合併後代表完整履歷的欄位名稱
-merged_resume_column_name = "合併經歷Entries"
+    # --- 設定 Selenium WebDriver ---
+    options = webdriver.ChromeOptions()
+    # options.add_argument('--headless')  # (可選) 無頭模式，不在螢幕上顯示瀏覽器視窗
+    options.add_argument("--disable-gpu")  # 在某些系統上 headless 模式需要
+    options.add_argument("--log-level=3")  # 減少 Selenium 的控制台輸出
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    )  # 設定 User Agent
 
-# 合併履歷條目時使用的分隔符號
-separator = "\n------------------------------\n"  # 使用換行和較長的分隔線
+    if driver_path:
+        service = Service(executable_path=driver_path)
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        # 嘗試讓 Selenium 自動管理或從 PATH 查找
+        print("未指定 driver_path，將嘗試自動查找 WebDriver...")
+        driver = webdriver.Chrome(options=options)
 
-# --- 資料處理主程式 ---
+    print(f"開始使用 Selenium 爬取，總共 {max_pages} 頁...")
 
-print(f"正在讀取輸入文件: {input_csv_path}")
-
-try:
-    # 讀取 CSV 文件，嘗試使用 utf-8-sig 編碼
-    df = pd.read_csv(input_csv_path, encoding="utf-8-sig")
-    print("文件讀取成功。")
-    # print("\n原始 DataFrame 的前幾行:")
-    # print(df.head())
-    print("\n原始 DataFrame 的欄位名稱:")
-    print(df.columns.tolist())
-
-    # *** 檢查必要的欄位是否存在 ***
-    required_columns = [name_column] + entry_component_columns
-    actual_columns = df.columns.tolist()
-    missing_cols = [col for col in required_columns if col not in actual_columns]
-
-    if name_column not in actual_columns:
-        print(f"\n錯誤：找不到姓名欄位 '{name_column}'。請檢查設定。")
-        exit()
-    if not all(col in actual_columns for col in entry_component_columns):
-        print(
-            f"\n警告：以下用於組合經歷的欄位部分或全部缺失，將僅使用存在的欄位: {missing_cols}"
-        )
-        # 更新實際存在的欄位列表
-        entry_component_columns = [
-            col for col in entry_component_columns if col in actual_columns
-        ]
-        if not entry_component_columns:
-            print(
-                f"\n錯誤：完全找不到任何可以用於組合經歷的欄位 ({entry_component_columns})。"
-            )
-            exit()
-
-    # --- 預處理 ---
-    # 1. 清理姓名欄位的前後空白，並移除姓名為空的行
-    df[name_column] = df[name_column].str.strip()
-    df = df.dropna(subset=[name_column])
-    df = df[df[name_column] != ""]
-
-    # 2. 將用於組合的欄位轉為字串，填充 NaN 為空字串
-    for col in entry_component_columns:
-        df[col] = df[col].fillna("").astype(str)
-
-    # --- 組合單條經歷描述 ---
-    # 定義一個函數來格式化每一行的經歷
-    def format_entry(row):
-        entry_parts = []
-        # 根據 entry_component_columns 的順序添加非空內容
-        date_val = row.get("命令日期Release date", "").strip()
-        org_val = row.get(
-            "機關 | 官/職等 | 職務Organization | Rank/Grade | Capacity", ""
-        ).strip()
-        reason_val = row.get("原因Reason", "").strip()
-        category_val = row.get("類別Category", "").strip()
-        situation_val = row.get("狀態Situation", "").strip()
-
-        if date_val:
-            entry_parts.append(f"日期: {date_val}")
-        if category_val:
-            entry_parts.append(f"類別: {category_val}")
-        if situation_val:
-            entry_parts.append(f"狀態: {situation_val}")
-        if org_val:
-            # 這個欄位名太長，用簡稱
-            entry_parts.append(f"機關/職務: {org_val}")
-        if reason_val:
-            entry_parts.append(f"原因: {reason_val}")
-
-        # 使用換行連接每個部分，如果只有一個部分則不加換行
-        return "\n".join(entry_parts) if len(entry_parts) > 1 else "".join(entry_parts)
-
-    print("\n正在為每一行創建組合的經歷描述...")
-    # 應用函數到每一行，創建一個新的臨時欄位 '_CombinedEntry'
-    df["_CombinedEntry"] = df.apply(format_entry, axis=1)
-
-    # 顯示一些組合後的條目範例
-    # print("\n組合後的單條經歷範例:")
-    # print(df[['姓名Name', '_CombinedEntry']].head())
-
-    # --- 分組與合併 ---
-    print(f"\n將根據 '{name_column}' 欄位進行分組...")
-    print(f"將合併組合後的經歷條目，使用分隔符...")
-
-    # 定義合併函數：將同組內的履歷條目用指定分隔符連接起來
-    # 過濾掉完全空的條目
-    def merge_formatted_resumes(series):
-        valid_entries = [entry for entry in series if entry and not entry.isspace()]
-        return separator.join(valid_entries)
-
-    # 執行分組和聚合
-    # 只聚合我們新創建的 _CombinedEntry 欄位
-    merged_df = df.groupby(name_column, as_index=False).agg(
-        **{merged_resume_column_name: ("_CombinedEntry", merge_formatted_resumes)}
-        # 使用 Python 3.5+ 的 kwargs 語法來動態命名聚合後的欄位
-        # 等同於 {'合併經歷Entries': ('_CombinedEntry', merge_formatted_resumes)}
-    )
-
-    print("\n--- 合併後的結果預覽 (前 5 筆) ---")
-    # 為了更好的預覽，可以調整 Pandas 的顯示選項 (可選)
-    # pd.set_option('display.max_colwidth', 200) # 顯示更多欄位內容
-    print(merged_df.head())
-    print(f"\n合併完成，共得到 {len(merged_df)} 筆獨立的姓名記錄。")
-
-    # --- 保存結果 ---
     try:
-        merged_df.to_csv(output_csv_path, index=False, encoding="utf-8-sig")
-        print(f"\n合併後的數據已成功保存到文件: {output_csv_path}")
-    except Exception as e:
-        print(f"\n保存合併後的 CSV 文件時出錯: {e}")
+        for page_num in range(1, max_pages + 1):
+            url = f"{base_url}{page_num}"
+            print(f"正在加載第 {page_num}/{max_pages} 頁: {url}")
 
-except FileNotFoundError:
-    print(
-        f"錯誤：找不到輸入的 CSV 文件 '{input_csv_path}'。請確保文件存在於正確的路徑。"
+            try:
+                driver.get(url)
+
+                # --- 等待目標表格加載完成 ---
+                # 這是關鍵步驟！等待最多 20 秒，直到 id 為 target_table_id 的元素出現
+                wait = WebDriverWait(driver, 20)
+                wait.until(EC.presence_of_element_located((By.ID, target_table_id)))
+                print(f"第 {page_num} 頁表格 '{target_table_id}' 已加載。")
+
+                # 獲取頁面原始碼 (現在應該包含動態加載的表格了)
+                page_source = driver.page_source
+
+                # 使用 BeautifulSoup 解析渲染後的 HTML
+                soup = BeautifulSoup(page_source, "lxml")
+
+                # 找到目標表格
+                table = soup.find("table", id=target_table_id)
+
+                if not table:
+                    # 理論上 WebDriverWait 會確保表格存在，但加個保險
+                    print(
+                        f"警告：在第 {page_num} 頁雖然等到元素，但 BeautifulSoup 未解析到表格。"
+                    )
+                    continue
+
+                # --- 提取表頭 (僅在第一頁且表頭列表為空時執行) ---
+                if page_num == 1 and not headers_list:
+                    header_row = table.find("thead")
+                    if not header_row:
+                        header_row = table.find("tr")
+                    if header_row:
+                        headers_list = [
+                            th.get_text(strip=True)
+                            for th in header_row.find_all(["th", "td"])
+                        ]
+                        print(f"提取到的表頭: {headers_list}")
+                    else:
+                        print("警告：無法在第一頁找到表頭。")
+
+                # --- 提取表格數據行 ---
+                tbody = table.find("tbody")
+                rows = tbody.find_all("tr") if tbody else table.find_all("tr")
+                # 如果表頭在第一個 tr 且 headers_list 已被提取，需要跳過
+                if headers_list and not tbody and rows:
+                    rows = rows[1:]
+
+                if not rows:
+                    print(f"警告：在第 {page_num} 頁的表格中找不到數據行 (tr)。")
+                    continue
+
+                for row in rows:
+                    cols = [td.get_text(strip=True) for td in row.find_all("td")]
+                    if cols:
+                        all_data.append(cols)
+
+                # --- 添加隨機延遲 ---
+                sleep_time = random.uniform(
+                    1.0, 2.5
+                )  # Selenium 操作通常慢些，延遲可以稍長
+                print(f"完成第 {page_num} 頁，休息 {sleep_time:.2f} 秒...")
+                time.sleep(sleep_time)
+
+            except TimeoutException:
+                print(
+                    f"錯誤：在第 {page_num} 頁等待表格 '{target_table_id}' 超時。可能該頁無數據或網頁結構改變。"
+                )
+                # 可以選擇跳過 (continue) 或停止 (break)
+                continue
+            except NoSuchElementException:
+                print(
+                    f"錯誤：在第 {page_num} 頁找不到元素。 WebDriverWait 後續可能出錯。"
+                )
+                continue
+            except Exception as e:
+                print(f"處理第 {page_num} 頁時發生未知錯誤: {e}")
+                continue
+
+    finally:
+        # --- 確保瀏覽器關閉 ---
+        print("爬取結束或遇到錯誤，關閉瀏覽器...")
+        driver.quit()
+
+    print(f"爬取完成！總共提取了 {len(all_data)} 筆數據。")
+
+    # --- 將數據轉換為 Pandas DataFrame ---
+    if all_data:
+        if headers_list and len(all_data[0]) == len(headers_list):
+            df = pd.DataFrame(all_data, columns=headers_list)
+        else:
+            print(
+                "警告：提取到的表頭數量與數據列數不匹配，或未找到表頭。將使用預設數字索引作為列名。"
+            )
+            df = pd.DataFrame(all_data)
+    else:
+        print("未提取到任何數據。")
+        df = pd.DataFrame()
+
+    return df
+
+
+# --- 主程式執行部分 ---
+if __name__ == "__main__":
+    # 設定要爬取的總頁數
+    total_pages_to_scrape = 75
+
+    # --- 設定你的 WebDriver 路徑 ---
+    # Windows 範例: "C:/path/to/chromedriver.exe" (注意使用 / 或 \\)
+    # Linux/Mac 範例: "/path/to/chromedriver"
+    # 如果 WebDriver 在腳本同目錄或 PATH 中，可以設為 None，但建議明確指定
+    webdriver_executable_path = (
+        None  # <-- 在這裡填寫你的 chromedriver 路徑! 例如: 'chromedriver.exe'
     )
-except pd.errors.EmptyDataError:
-    print(f"錯誤：輸入的 CSV 文件 '{input_csv_path}' 是空的。")
-except KeyError as e:
-    print(
-        f"\n錯誤：程式碼中使用的欄位名稱 '{e}' 在您的 CSV 文件中不存在。請仔細檢查 'name_column' 和 'entry_component_columns' 的設定。"
+
+    if webdriver_executable_path is None:
+        print("警告：未在程式碼中指定 WebDriver 路徑。")
+        print(
+            "請確保 chromedriver(.exe) 在您的系統 PATH 中，或者在程式碼中設置 'webdriver_executable_path' 變數。"
+        )
+        # 你也可以在這裡直接提示用戶輸入路徑
+        # webdriver_executable_path = input("請輸入 ChromeDriver 的完整路徑: ")
+
+    # 執行爬蟲函式
+    scraped_df = scrape_nccu_lib_dynamic(
+        max_pages=total_pages_to_scrape, driver_path=webdriver_executable_path
     )
-except Exception as e:
-    print(f"處理過程中發生未預期的錯誤: {e}")
+
+    # 顯示 DataFrame 的前幾行和基本資訊
+    if not scraped_df.empty:
+        print("\n--- 爬取結果預覽 (前 5 筆) ---")
+        print(scraped_df.head())
+
+        print("\n--- DataFrame 資訊 ---")
+        scraped_df.info()
+
+        # --- (可選) 將 DataFrame 存儲為 CSV 文件 ---
+        try:
+            output_filename = "nccu_library_scrape_胡_dynamic.csv"
+            scraped_df.to_csv(output_filename, index=False, encoding="utf-8-sig")
+            print(f"\n數據已成功保存到文件: {output_filename}")
+        except Exception as e:
+            print(f"\n保存 CSV 文件時出錯: {e}")
+    else:
+        print("\n爬蟲未獲取到數據，無法生成預覽或保存文件。")
